@@ -1,8 +1,8 @@
 import io
 import json
-import logging
 import os
 import pathlib
+import platform
 import re
 import sys
 import tempfile
@@ -12,14 +12,17 @@ from typing import Optional, Union, List, Type
 import mock
 from packaging.version import Version
 
-from publish import pull_request_build_mode_merge, fail_on_mode_failures, fail_on_mode_errors, \
-    fail_on_mode_nothing, comment_modes, comment_mode_always, \
+from publish import __version__, pull_request_build_mode_merge, fail_on_mode_failures, fail_on_mode_errors, \
+    fail_on_mode_nothing, comment_modes, comment_mode_always, report_suite_out_log, report_suite_err_log, \
+    report_suite_logs, report_no_suite_logs, default_report_suite_logs, \
+    default_annotations, all_tests_list, skipped_tests_list, none_annotations, \
     pull_request_build_modes, punctuation_space
 from publish.github_action import GithubAction
-from publish.unittestresults import ParsedUnitTestResults, ParseError
-from publish_test_results import get_conclusion, get_commit_sha, get_var, \
+from publish.unittestresults import UnitTestSuite, ParsedUnitTestResults, ParseError
+from publish_test_results import action_fail_required, get_conclusion, get_commit_sha, get_var, \
     check_var, check_var_condition, deprecate_var, deprecate_val, log_parse_errors, \
-    get_settings, get_annotations_config, Settings, get_files, throttle_gh_request_raw, is_float, parse_files, main
+    get_settings, get_annotations_config, Settings, get_files, is_float, parse_files, \
+    main, prettify_glob_pattern
 from test_utils import chdir
 
 test_files_path = pathlib.Path(__file__).resolve().parent / 'files'
@@ -28,6 +31,7 @@ event = dict(pull_request=dict(head=dict(sha='event_sha')))
 
 
 class Test(unittest.TestCase):
+    details = [UnitTestSuite('suite', 7, 3, 2, 1, 'std-out', 'std-err')]
 
     def test_get_conclusion_success(self):
         for fail_on_errors in [True, False]:
@@ -42,6 +46,7 @@ class Test(unittest.TestCase):
                         suite_failures=0,
                         suite_errors=0,
                         suite_time=10,
+                        suite_details=self.details,
                         cases=[]
                     ), fail_on_errors=fail_on_errors, fail_on_failures=fail_on_failures)
                     self.assertEqual('success', actual)
@@ -59,6 +64,7 @@ class Test(unittest.TestCase):
                         suite_failures=1,
                         suite_errors=0,
                         suite_time=10,
+                        suite_details=self.details,
                         cases=[]
                     ), fail_on_errors=fail_on_errors, fail_on_failures=fail_on_failures)
                     self.assertEqual('failure' if fail_on_failures else 'success', actual)
@@ -76,6 +82,7 @@ class Test(unittest.TestCase):
                         suite_failures=0,
                         suite_errors=1,
                         suite_time=10,
+                        suite_details=self.details,
                         cases=[]
                     ), fail_on_errors=fail_on_errors, fail_on_failures=fail_on_failures)
                     self.assertEqual('failure' if fail_on_errors else 'success', actual)
@@ -93,6 +100,7 @@ class Test(unittest.TestCase):
                         suite_failures=0,
                         suite_errors=0,
                         suite_time=0,
+                        suite_details=self.details,
                         cases=[]
                     ), fail_on_errors=fail_on_errors, fail_on_failures=fail_on_failures)
                     self.assertEqual('neutral', actual)
@@ -110,6 +118,7 @@ class Test(unittest.TestCase):
                         suite_failures=0,
                         suite_errors=0,
                         suite_time=10,
+                        suite_details=self.details,
                         cases=[]
                     ), fail_on_errors=fail_on_errors, fail_on_failures=fail_on_failures)
                     self.assertEqual('failure' if fail_on_errors else 'success', actual)
@@ -138,81 +147,109 @@ class Test(unittest.TestCase):
 
     @classmethod
     def get_settings_no_default_files(cls,
+                                      files_glob=None,
                                       junit_files_glob=None,
                                       nunit_files_glob=None,
                                       xunit_files_glob=None,
                                       trx_files_glob=None) -> Settings:
-        return cls.get_settings(junit_files_glob=junit_files_glob,
+        return cls.get_settings(files_glob=files_glob,
+                                junit_files_glob=junit_files_glob,
                                 nunit_files_glob=nunit_files_glob,
                                 xunit_files_glob=xunit_files_glob,
                                 trx_files_glob=trx_files_glob)
 
     @staticmethod
     def get_settings(token='token',
+                     actor='actor',
                      api_url='http://github.api.url/',
                      graphql_url='http://github.graphql.url/',
                      retries=2,
                      event={},
                      event_file=None,
                      event_name='event name',
+                     is_fork=False,
                      repo='repo',
                      commit='commit',
                      fail_on_errors=True,
                      fail_on_failures=True,
+                     action_fail=False,
+                     action_fail_on_inconclusive=False,
+                     files_glob='all-files',
                      junit_files_glob='junit-files',
                      nunit_files_glob='nunit-files',
                      xunit_files_glob='xunit-files',
                      trx_files_glob='trx-files',
                      time_factor=1.0,
+                     test_file_prefix=None,
                      check_name='check name',
                      comment_title='title',
                      comment_mode=comment_mode_always,
+                     check_run=True,
                      job_summary=True,
                      compare_earlier=True,
                      test_changes_limit=10,
                      pull_request_build=pull_request_build_mode_merge,
                      report_individual_runs=True,
+                     report_suite_out_logs=False,
+                     report_suite_err_logs=False,
                      dedup_classes_by_file_name=True,
+                     large_files=False,
                      ignore_runs=False,
-                     check_run_annotation=[],
+                     check_run_annotation=default_annotations,
                      seconds_between_github_reads=1.5,
                      seconds_between_github_writes=2.5,
+                     secondary_rate_limit_wait_seconds=6.0,
                      json_file=None,
                      json_thousands_separator=punctuation_space,
-                     json_test_case_results=False) -> Settings:
+                     json_suite_details=False,
+                     json_test_case_results=False,
+                     search_pull_requests=False) -> Settings:
         return Settings(
             token=token,
+            actor=actor,
             api_url=api_url,
             graphql_url=graphql_url,
             api_retries=retries,
             event=event.copy(),
             event_file=event_file,
             event_name=event_name,
+            is_fork=is_fork,
             repo=repo,
             commit=commit,
             json_file=json_file,
             json_thousands_separator=json_thousands_separator,
+            json_suite_details=json_suite_details,
             json_test_case_results=json_test_case_results,
             fail_on_errors=fail_on_errors,
             fail_on_failures=fail_on_failures,
+            action_fail=action_fail,
+            action_fail_on_inconclusive=action_fail_on_inconclusive,
+            files_glob=files_glob,
             junit_files_glob=junit_files_glob,
             nunit_files_glob=nunit_files_glob,
             xunit_files_glob=xunit_files_glob,
             trx_files_glob=trx_files_glob,
             time_factor=time_factor,
+            test_file_prefix=test_file_prefix,
             check_name=check_name,
             comment_title=comment_title,
             comment_mode=comment_mode,
+            check_run=check_run,
             job_summary=job_summary,
             compare_earlier=compare_earlier,
             pull_request_build=pull_request_build,
             test_changes_limit=test_changes_limit,
             report_individual_runs=report_individual_runs,
+            report_suite_out_logs=report_suite_out_logs,
+            report_suite_err_logs=report_suite_err_logs,
             dedup_classes_by_file_name=dedup_classes_by_file_name,
+            large_files=large_files,
             ignore_runs=ignore_runs,
             check_run_annotation=check_run_annotation.copy(),
             seconds_between_github_reads=seconds_between_github_reads,
-            seconds_between_github_writes=seconds_between_github_writes
+            seconds_between_github_writes=seconds_between_github_writes,
+            secondary_rate_limit_wait_seconds=secondary_rate_limit_wait_seconds,
+            search_pull_requests=search_pull_requests,
         )
 
     def test_get_settings(self):
@@ -236,6 +273,15 @@ class Test(unittest.TestCase):
 
             self.do_test_get_settings(EVENT_FILE=filepath, expected=self.get_settings(event=event, event_file=filepath))
 
+    def test_get_settings_github_token(self):
+        self.do_test_get_settings(GITHUB_TOKEN='token-one', expected=self.get_settings(token='token-one'))
+        self.do_test_get_settings(GITHUB_TOKEN='token-two', expected=self.get_settings(token='token-two'))
+        # see test_get_settings_missing_github_vars
+
+    def test_get_settings_github_token_actor(self):
+        self.do_test_get_settings(GITHUB_TOKEN_ACTOR='other-actor', expected=self.get_settings(actor='other-actor'))
+        self.do_test_get_settings(GITHUB_TOKEN_ACTOR=None, expected=self.get_settings(actor='github-actions'))
+
     def test_get_settings_github_api_url(self):
         self.do_test_get_settings(GITHUB_API_URL='https://api.github.onpremise.com', expected=self.get_settings(api_url='https://api.github.onpremise.com'))
         self.do_test_get_settings(GITHUB_API_URL=None, expected=self.get_settings(api_url='https://api.github.com'))
@@ -257,47 +303,49 @@ class Test(unittest.TestCase):
                 self.assertIn(f'GITHUB_RETRIES must be a positive integer or 0: {retries}', re.exception.args)
 
     def test_get_settings_any_files(self):
-        for junit in [None, 'junit-file']:
-            for nunit in [None, 'nunit-file']:
-                for xunit in [None, 'xunit-file']:
-                    for trx in [None, 'trx-file']:
-                        with self.subTest(junit=junit, nunit=nunit, xunit=xunit, trx=trx):
-                            any_flavour_set = any([flavour is not None for flavour in [junit, nunit, xunit, trx]])
-                            expected = self.get_settings(junit_files_glob=junit if any_flavour_set else '*.xml',
-                                                         nunit_files_glob=nunit,
-                                                         xunit_files_glob=xunit,
-                                                         trx_files_glob=trx)
-                            warnings = None if any_flavour_set else 'At least one of the *_FILES options has to be set! ' \
-                                                                    'Falling back to deprecated default "*.xml"'
+        for files in [None, 'file']:
+            for junit in [None, 'junit-file']:
+                for nunit in [None, 'nunit-file']:
+                    for xunit in [None, 'xunit-file']:
+                        for trx in [None, 'trx-file']:
+                            with self.subTest(files=files, junit=junit, nunit=nunit, xunit=xunit, trx=trx):
+                                any_flavour_set = any([flavour is not None for flavour in [files, junit, nunit, xunit, trx]])
+                                expected = self.get_settings(files_glob=files if any_flavour_set else '*.xml',
+                                                             junit_files_glob=junit,
+                                                             nunit_files_glob=nunit,
+                                                             xunit_files_glob=xunit,
+                                                             trx_files_glob=trx)
+                                warnings = None if any_flavour_set else 'At least one of the FILES, JUNIT_FILES, NUNIT_FILES, ' \
+                                                                        'XUNIT_FILES, or TRX_FILES options has to be set! ' \
+                                                                        'Falling back to deprecated default "*.xml"'
 
-                            self.do_test_get_settings(JUNIT_FILES=junit, NUNIT_FILES=nunit, XUNIT_FILES=xunit, TRX_FILES=trx,
-                                                      expected=expected, warning=warnings)
+                                self.do_test_get_settings(FILES=files, JUNIT_FILES=junit, NUNIT_FILES=nunit, XUNIT_FILES=xunit, TRX_FILES=trx,
+                                                          expected=expected, warning=warnings)
+
+    def test_get_settings_files(self):
+        self.do_test_get_settings_no_default_files(FILES='file', expected=self.get_settings_no_default_files(files_glob='file'))
+        self.do_test_get_settings_no_default_files(FILES='file\nfile2', expected=self.get_settings_no_default_files(files_glob='file\nfile2'))
+        self.do_test_get_settings_no_default_files(FILES=None, expected=self.get_settings_no_default_files(files_glob='*.xml'), warning='At least one of the FILES, JUNIT_FILES, NUNIT_FILES, XUNIT_FILES, or TRX_FILES options has to be set! Falling back to deprecated default "*.xml"')
 
     def test_get_settings_junit_files(self):
         self.do_test_get_settings_no_default_files(JUNIT_FILES='file', expected=self.get_settings_no_default_files(junit_files_glob='file'))
         self.do_test_get_settings_no_default_files(JUNIT_FILES='file\nfile2', expected=self.get_settings_no_default_files(junit_files_glob='file\nfile2'))
-        self.do_test_get_settings_no_default_files(JUNIT_FILES=None, expected=self.get_settings_no_default_files(junit_files_glob='*.xml'), warning='At least one of the *_FILES options has to be set! Falling back to deprecated default "*.xml"')
-
-        # this is the deprecated version of JUNIT_FILES
-        self.do_test_get_settings_no_default_files(JUNIT_FILES='junit-file', FILES='file', expected=self.get_settings_no_default_files(junit_files_glob='junit-file'), warning='Option FILES is deprecated, please use JUNIT_FILES instead!')
-        self.do_test_get_settings_no_default_files(JUNIT_FILES=None, FILES='file', expected=self.get_settings_no_default_files(junit_files_glob='file'), warning='Option FILES is deprecated, please use JUNIT_FILES instead!')
-        self.do_test_get_settings_no_default_files(JUNIT_FILES=None, FILES='file\nfile2', expected=self.get_settings_no_default_files(junit_files_glob='file\nfile2'), warning='Option FILES is deprecated, please use JUNIT_FILES instead!')
-        self.do_test_get_settings_no_default_files(JUNIT_FILES=None, FILES=None, expected=self.get_settings_no_default_files(junit_files_glob='*.xml'), warning='At least one of the *_FILES options has to be set! Falling back to deprecated default "*.xml"')
+        self.do_test_get_settings_no_default_files(JUNIT_FILES=None, expected=self.get_settings_no_default_files(files_glob='*.xml'), warning='At least one of the FILES, JUNIT_FILES, NUNIT_FILES, XUNIT_FILES, or TRX_FILES options has to be set! Falling back to deprecated default "*.xml"')
 
     def test_get_settings_nunit_files(self):
         self.do_test_get_settings_no_default_files(NUNIT_FILES='file', expected=self.get_settings_no_default_files(nunit_files_glob='file'))
         self.do_test_get_settings_no_default_files(NUNIT_FILES='file\nfile2', expected=self.get_settings_no_default_files(nunit_files_glob='file\nfile2'))
-        self.do_test_get_settings_no_default_files(NUNIT_FILES=None, expected=self.get_settings_no_default_files(nunit_files_glob=None, junit_files_glob='*.xml'), warning='At least one of the *_FILES options has to be set! Falling back to deprecated default "*.xml"')
+        self.do_test_get_settings_no_default_files(NUNIT_FILES=None, expected=self.get_settings_no_default_files(files_glob='*.xml'), warning='At least one of the FILES, JUNIT_FILES, NUNIT_FILES, XUNIT_FILES, or TRX_FILES options has to be set! Falling back to deprecated default "*.xml"')
 
     def test_get_settings_xunit_files(self):
         self.do_test_get_settings_no_default_files(XUNIT_FILES='file', expected=self.get_settings_no_default_files(xunit_files_glob='file'))
         self.do_test_get_settings_no_default_files(XUNIT_FILES='file\nfile2', expected=self.get_settings_no_default_files(xunit_files_glob='file\nfile2'))
-        self.do_test_get_settings_no_default_files(XUNIT_FILES=None, expected=self.get_settings_no_default_files(xunit_files_glob=None, junit_files_glob='*.xml'), warning='At least one of the *_FILES options has to be set! Falling back to deprecated default "*.xml"')
+        self.do_test_get_settings_no_default_files(XUNIT_FILES=None, expected=self.get_settings_no_default_files(files_glob='*.xml'), warning='At least one of the FILES, JUNIT_FILES, NUNIT_FILES, XUNIT_FILES, or TRX_FILES options has to be set! Falling back to deprecated default "*.xml"')
 
     def test_get_settings_trx_files(self):
         self.do_test_get_settings_no_default_files(TRX_FILES='file', expected=self.get_settings_no_default_files(trx_files_glob='file'))
         self.do_test_get_settings_no_default_files(TRX_FILES='file\nfile2', expected=self.get_settings_no_default_files(trx_files_glob='file\nfile2'))
-        self.do_test_get_settings_no_default_files(TRX_FILES=None, expected=self.get_settings_no_default_files(trx_files_glob=None, junit_files_glob='*.xml'), warning='At least one of the *_FILES options has to be set! Falling back to deprecated default "*.xml"')
+        self.do_test_get_settings_no_default_files(TRX_FILES=None, expected=self.get_settings_no_default_files(files_glob='*.xml'), warning='At least one of the FILES, JUNIT_FILES, NUNIT_FILES, XUNIT_FILES, or TRX_FILES options has to be set! Falling back to deprecated default "*.xml"')
 
     def test_get_settings_time_unit(self):
         self.do_test_get_settings(TIME_UNIT=None, expected=self.get_settings(time_factor=1.0))
@@ -309,13 +357,23 @@ class Test(unittest.TestCase):
         self.assertIn('TIME_UNIT minutes is not supported. It is optional, '
                       'but when given must be one of these values: seconds, milliseconds', re.exception.args)
 
+    def test_get_settings_test_file_prefix(self):
+        self.do_test_get_settings(TEST_FILE_PREFIX=None, expected=self.get_settings(test_file_prefix=None))
+        self.do_test_get_settings(TEST_FILE_PREFIX='', expected=self.get_settings(test_file_prefix=None))
+        self.do_test_get_settings(TEST_FILE_PREFIX='+src/', expected=self.get_settings(test_file_prefix='+src/'))
+        self.do_test_get_settings(TEST_FILE_PREFIX='-./', expected=self.get_settings(test_file_prefix='-./'))
+
+        with self.assertRaises(RuntimeError) as re:
+            self.do_test_get_settings(TEST_FILE_PREFIX='path/', expected=None)
+        self.assertIn("TEST_FILE_PREFIX is optional, but when given, it must start with '-' or '+': path/", re.exception.args)
+
     def test_get_settings_commit(self):
         event = {'pull_request': {'head': {'sha': 'sha2'}}}
-        self.do_test_get_settings(INPUT_COMMIT='sha', GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha', event=event, event_name='pull_request'))
-        self.do_test_get_settings(COMMIT='sha', GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha', event=event, event_name='pull_request'))
-        self.do_test_get_settings(COMMIT=None, GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha2', event=event, event_name='pull_request'))
-        self.do_test_get_settings(COMMIT=None, INPUT_GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha2', event=event, event_name='pull_request'))
-        self.do_test_get_settings(COMMIT=None, GITHUB_EVENT_NAME='push', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='default', event=event, event_name='push'))
+        self.do_test_get_settings(INPUT_COMMIT='sha', GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha', event=event, event_name='pull_request', is_fork=True))
+        self.do_test_get_settings(COMMIT='sha', GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha', event=event, event_name='pull_request', is_fork=True))
+        self.do_test_get_settings(COMMIT=None, GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha2', event=event, event_name='pull_request', is_fork=True))
+        self.do_test_get_settings(COMMIT=None, INPUT_GITHUB_EVENT_NAME='pull_request', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='sha2', event=event, event_name='pull_request', is_fork=True))
+        self.do_test_get_settings(COMMIT=None, GITHUB_EVENT_NAME='push', event=event, GITHUB_SHA='default', expected=self.get_settings(commit='default', event=event, event_name='push', is_fork=False))
         with self.assertRaises(RuntimeError) as re:
             self.do_test_get_settings(COMMIT=None, GITHUB_EVENT_NAME='pull_request', event={}, GITHUB_SHA='default', expected=None)
         self.assertIn('Commit SHA must be provided via action input or environment variable COMMIT, GITHUB_SHA or event file', re.exception.args)
@@ -331,6 +389,24 @@ class Test(unittest.TestCase):
         self.do_test_get_settings(FAIL_ON=fail_on_mode_failures, expected=self.get_settings(fail_on_errors=True, fail_on_failures=True))
         self.do_test_get_settings(FAIL_ON=fail_on_mode_errors, expected=self.get_settings(fail_on_errors=True, fail_on_failures=False))
         self.do_test_get_settings(FAIL_ON=fail_on_mode_nothing, expected=self.get_settings(fail_on_errors=False, fail_on_failures=False))
+
+    def test_get_settings_action_fail_on(self):
+        warning = 'Option action_fail has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(ACTION_FAIL='true', expected=self.get_settings(action_fail=True))
+        self.do_test_get_settings(ACTION_FAIL='True', expected=self.get_settings(action_fail=True))
+        self.do_test_get_settings(ACTION_FAIL='false', expected=self.get_settings(action_fail=False))
+        self.do_test_get_settings(ACTION_FAIL='False', expected=self.get_settings(action_fail=False))
+        self.do_test_get_settings(ACTION_FAIL='foo', expected=self.get_settings(action_fail=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(ACTION_FAIL=None, expected=self.get_settings(action_fail=False))
+
+    def test_get_settings_action_fail_on_inconclusive(self):
+        warning = 'Option action_fail_on_inconclusive has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(ACTION_FAIL_ON_INCONCLUSIVE='true', expected=self.get_settings(action_fail_on_inconclusive=True))
+        self.do_test_get_settings(ACTION_FAIL_ON_INCONCLUSIVE='True', expected=self.get_settings(action_fail_on_inconclusive=True))
+        self.do_test_get_settings(ACTION_FAIL_ON_INCONCLUSIVE='false', expected=self.get_settings(action_fail_on_inconclusive=False))
+        self.do_test_get_settings(ACTION_FAIL_ON_INCONCLUSIVE='False', expected=self.get_settings(action_fail_on_inconclusive=False))
+        self.do_test_get_settings(ACTION_FAIL_ON_INCONCLUSIVE='foo', expected=self.get_settings(action_fail_on_inconclusive=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(ACTION_FAIL_ON_INCONCLUSIVE=None, expected=self.get_settings(action_fail_on_inconclusive=False))
 
     def test_get_settings_pull_request_build(self):
         for mode in pull_request_build_modes:
@@ -382,6 +458,15 @@ class Test(unittest.TestCase):
         self.do_test_get_settings(COMPARE_TO_EARLIER_COMMIT='foo', expected=self.get_settings(compare_earlier=True), warning=warning, exception=RuntimeError)
         self.do_test_get_settings(COMPARE_TO_EARLIER_COMMIT=None, expected=self.get_settings(compare_earlier=True))
 
+    def test_get_settings_check_run(self):
+        warning = 'Option check_run has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(CHECK_RUN='false', expected=self.get_settings(check_run=False))
+        self.do_test_get_settings(CHECK_RUN='False', expected=self.get_settings(check_run=False))
+        self.do_test_get_settings(CHECK_RUN='true', expected=self.get_settings(check_run=True))
+        self.do_test_get_settings(CHECK_RUN='True', expected=self.get_settings(check_run=True))
+        self.do_test_get_settings(CHECK_RUN='foo', expected=self.get_settings(check_run=True), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(CHECK_RUN=None, expected=self.get_settings(check_run=True))
+
     def test_get_settings_job_summary(self):
         warning = 'Option job_summary has to be boolean, so either "true" or "false": foo'
         self.do_test_get_settings(JOB_SUMMARY='false', expected=self.get_settings(job_summary=False))
@@ -400,6 +485,18 @@ class Test(unittest.TestCase):
         self.do_test_get_settings(REPORT_INDIVIDUAL_RUNS='foo', expected=self.get_settings(report_individual_runs=False), warning=warning, exception=RuntimeError)
         self.do_test_get_settings(REPORT_INDIVIDUAL_RUNS=None, expected=self.get_settings(report_individual_runs=False))
 
+    def test_get_settings_report_suite_logs(self):
+        self.do_test_get_settings(REPORT_SUITE_LOGS=None, expected=self.get_settings(report_suite_out_logs=False, report_suite_err_logs=False))
+        self.do_test_get_settings(REPORT_SUITE_LOGS=default_report_suite_logs, expected=self.get_settings(report_suite_out_logs=False, report_suite_err_logs=False))
+        self.do_test_get_settings(REPORT_SUITE_LOGS=report_no_suite_logs, expected=self.get_settings(report_suite_out_logs=False, report_suite_err_logs=False))
+        self.do_test_get_settings(REPORT_SUITE_LOGS=report_suite_out_log, expected=self.get_settings(report_suite_out_logs=True, report_suite_err_logs=False))
+        self.do_test_get_settings(REPORT_SUITE_LOGS=report_suite_err_log, expected=self.get_settings(report_suite_out_logs=False, report_suite_err_logs=True))
+        self.do_test_get_settings(REPORT_SUITE_LOGS=report_suite_logs, expected=self.get_settings(report_suite_out_logs=True, report_suite_err_logs=True))
+
+        with self.assertRaises(RuntimeError) as re:
+            self.do_test_get_settings(REPORT_SUITE_LOGS='logs')
+        self.assertEqual("Value 'logs' is not supported for variable REPORT_SUITE_LOGS, expected: info, error, any, none", str(re.exception))
+
     def test_get_settings_dedup_classes_by_file_name(self):
         warning = 'Option deduplicate_classes_by_file_name has to be boolean, so either "true" or "false": foo'
         self.do_test_get_settings(DEDUPLICATE_CLASSES_BY_FILE_NAME='false', expected=self.get_settings(dedup_classes_by_file_name=False))
@@ -409,35 +506,67 @@ class Test(unittest.TestCase):
         self.do_test_get_settings(DEDUPLICATE_CLASSES_BY_FILE_NAME='foo', expected=self.get_settings(dedup_classes_by_file_name=False), warning=warning, exception=RuntimeError)
         self.do_test_get_settings(DEDUPLICATE_CLASSES_BY_FILE_NAME=None, expected=self.get_settings(dedup_classes_by_file_name=False))
 
+    def test_get_settings_large_files(self):
+        warning = 'Option large_files has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(LARGE_FILES='false', expected=self.get_settings(large_files=False, ignore_runs=False))
+        self.do_test_get_settings(LARGE_FILES='False', expected=self.get_settings(large_files=False, ignore_runs=False))
+        self.do_test_get_settings(LARGE_FILES='true', expected=self.get_settings(large_files=True, ignore_runs=False))
+        self.do_test_get_settings(LARGE_FILES='True', expected=self.get_settings(large_files=True, ignore_runs=False))
+        self.do_test_get_settings(LARGE_FILES='foo', expected=self.get_settings(large_files=False, ignore_runs=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(LARGE_FILES=None, expected=self.get_settings(large_files=False, ignore_runs=False))
+
     def test_get_settings_ignore_runs(self):
         warning = 'Option ignore_runs has to be boolean, so either "true" or "false": foo'
-        self.do_test_get_settings(IGNORE_RUNS='false', expected=self.get_settings(ignore_runs=False))
-        self.do_test_get_settings(IGNORE_RUNS='False', expected=self.get_settings(ignore_runs=False))
-        self.do_test_get_settings(IGNORE_RUNS='true', expected=self.get_settings(ignore_runs=True))
-        self.do_test_get_settings(IGNORE_RUNS='True', expected=self.get_settings(ignore_runs=True))
-        self.do_test_get_settings(IGNORE_RUNS='foo', expected=self.get_settings(ignore_runs=False), warning=warning, exception=RuntimeError)
-        self.do_test_get_settings(IGNORE_RUNS=None, expected=self.get_settings(ignore_runs=False))
+        self.do_test_get_settings(IGNORE_RUNS='false', expected=self.get_settings(ignore_runs=False, large_files=False))
+        self.do_test_get_settings(IGNORE_RUNS='False', expected=self.get_settings(ignore_runs=False, large_files=False))
+        self.do_test_get_settings(IGNORE_RUNS='true', expected=self.get_settings(ignore_runs=True, large_files=True))
+        self.do_test_get_settings(IGNORE_RUNS='True', expected=self.get_settings(ignore_runs=True, large_files=True))
+        self.do_test_get_settings(IGNORE_RUNS='true', LARGE_FILES='false', expected=self.get_settings(ignore_runs=True, large_files=False))
+        self.do_test_get_settings(IGNORE_RUNS='foo', expected=self.get_settings(ignore_runs=False, large_files=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(IGNORE_RUNS=None, expected=self.get_settings(ignore_runs=False, large_files=False))
 
     def test_get_settings_check_run_annotations(self):
-        # Note: more tests in test_get_annotations_config*
+        self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=None, expected=self.get_settings(check_run_annotation=default_annotations))
+        self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=','.join(default_annotations), expected=self.get_settings(check_run_annotation=default_annotations))
+        self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=all_tests_list, expected=self.get_settings(check_run_annotation=[all_tests_list]))
+        self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=skipped_tests_list, expected=self.get_settings(check_run_annotation=[skipped_tests_list]))
+        self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=none_annotations, expected=self.get_settings(check_run_annotation=[none_annotations]))
+
         with self.assertRaises(RuntimeError) as re:
-            self.do_test_get_settings(CHECK_RUN_ANNOTATIONS='annotation', expected=None)
-        self.assertEqual("Some values in 'annotation' are not supported for variable CHECK_RUN_ANNOTATIONS, allowed: all tests, skipped tests, none", str(re.exception))
+            self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=','.join([all_tests_list, skipped_tests_list, none_annotations]), expected=self.get_settings(check_run_annotation=[]))
+        self.assertEqual("CHECK_RUN_ANNOTATIONS 'none' cannot be combined with other annotations: all tests, skipped tests, none", str(re.exception))
+
+        with self.assertRaises(RuntimeError) as re:
+            self.do_test_get_settings(CHECK_RUN_ANNOTATIONS='annotations')
+        self.assertEqual("Some values in 'annotations' are not supported for variable CHECK_RUN_ANNOTATIONS, allowed: all tests, skipped tests, none", str(re.exception))
+
+        with self.assertRaises(RuntimeError) as re:
+            self.do_test_get_settings(CHECK_RUN_ANNOTATIONS=','.join([all_tests_list, skipped_tests_list, "more"]))
+        self.assertEqual("Some values in 'all tests, skipped tests, more' are not supported for variable CHECK_RUN_ANNOTATIONS, allowed: all tests, skipped tests, none", str(re.exception))
 
     def test_get_settings_seconds_between_github_reads(self):
-        self.do_test_get_settings_seconds_between_github_requests('SECONDS_BETWEEN_GITHUB_READS', 'seconds_between_github_reads', 1.0)
+        self.do_test_get_settings_seconds('SECONDS_BETWEEN_GITHUB_READS', 'seconds_between_github_reads', 1.0)
 
     def test_get_settings_seconds_between_github_writes(self):
-        self.do_test_get_settings_seconds_between_github_requests('SECONDS_BETWEEN_GITHUB_WRITES', 'seconds_between_github_writes', 2.0)
+        self.do_test_get_settings_seconds('SECONDS_BETWEEN_GITHUB_WRITES', 'seconds_between_github_writes', 2.0)
 
-    def do_test_get_settings_seconds_between_github_requests(self, env_var_name: str, settings_var_name: str, default: float):
+    def test_get_settings_secondary_rate_limit_wait_seconds(self):
+        self.do_test_get_settings_seconds('SECONDARY_RATE_LIMIT_WAIT_SECONDS', 'secondary_rate_limit_wait_seconds', 60)
+
+    def do_test_get_settings_seconds(self, env_var_name: str, settings_var_name: str, default: float):
         self.do_test_get_settings(**{env_var_name: '0.001', 'expected': self.get_settings(**{settings_var_name: 0.001})})
         self.do_test_get_settings(**{env_var_name: '1', 'expected': self.get_settings(**{settings_var_name: 1.0})})
         self.do_test_get_settings(**{env_var_name: '1.0', 'expected': self.get_settings(**{settings_var_name: 1.0})})
         self.do_test_get_settings(**{env_var_name: '2.5', 'expected': self.get_settings(**{settings_var_name: 2.5})})
         self.do_test_get_settings(**{env_var_name: None, 'expected': self.get_settings(**{settings_var_name: default})})
 
-        for val in ['0', '0.0', '-1', 'none', '12e']:
+        for val in ['none', '12e']:
+            with self.subTest(reads=val):
+                with self.assertRaises(RuntimeError) as re:
+                    self.do_test_get_settings(**{env_var_name: val, 'expected': None})
+                self.assertIn(f'{env_var_name} must be an integer or float number: {val}', re.exception.args)
+
+        for val in ['0', '0.0', '-1']:
             with self.subTest(reads=val):
                 with self.assertRaises(RuntimeError) as re:
                     self.do_test_get_settings(**{env_var_name: val, 'expected': None})
@@ -454,6 +583,33 @@ class Test(unittest.TestCase):
         self.do_test_get_settings(JSON_THOUSANDS_SEPARATOR='.', expected=self.get_settings(json_thousands_separator='.'))
         self.do_test_get_settings(JSON_THOUSANDS_SEPARATOR=' ', expected=self.get_settings(json_thousands_separator=' '))
 
+    def test_get_settings_json_test_case_results(self):
+        warning = 'Option json_test_case_results has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(JSON_TEST_CASE_RESULTS='false', expected=self.get_settings(json_test_case_results=False))
+        self.do_test_get_settings(JSON_TEST_CASE_RESULTS='False', expected=self.get_settings(json_test_case_results=False))
+        self.do_test_get_settings(JSON_TEST_CASE_RESULTS='true', expected=self.get_settings(json_test_case_results=True))
+        self.do_test_get_settings(JSON_TEST_CASE_RESULTS='True', expected=self.get_settings(json_test_case_results=True))
+        self.do_test_get_settings(JSON_TEST_CASE_RESULTS='foo', expected=self.get_settings(json_test_case_results=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(JSON_TEST_CASE_RESULTS=None, expected=self.get_settings(json_test_case_results=False))
+
+    def test_get_settings_json_suite_details(self):
+        warning = 'Option json_suite_details has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(JSON_SUITE_DETAILS='false', expected=self.get_settings(json_suite_details=False))
+        self.do_test_get_settings(JSON_SUITE_DETAILS='False', expected=self.get_settings(json_suite_details=False))
+        self.do_test_get_settings(JSON_SUITE_DETAILS='true', expected=self.get_settings(json_suite_details=True))
+        self.do_test_get_settings(JSON_SUITE_DETAILS='True', expected=self.get_settings(json_suite_details=True))
+        self.do_test_get_settings(JSON_SUITE_DETAILS='foo', expected=self.get_settings(json_suite_details=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(JSON_SUITE_DETAILS=None, expected=self.get_settings(json_suite_details=False))
+
+    def test_get_settings_search_pull_requests(self):
+        warning = 'Option search_pull_requests has to be boolean, so either "true" or "false": foo'
+        self.do_test_get_settings(SEARCH_PULL_REQUESTS='false', expected=self.get_settings(search_pull_requests=False))
+        self.do_test_get_settings(SEARCH_PULL_REQUESTS='False', expected=self.get_settings(search_pull_requests=False))
+        self.do_test_get_settings(SEARCH_PULL_REQUESTS='true', expected=self.get_settings(search_pull_requests=True))
+        self.do_test_get_settings(SEARCH_PULL_REQUESTS='True', expected=self.get_settings(search_pull_requests=True))
+        self.do_test_get_settings(SEARCH_PULL_REQUESTS='foo', expected=self.get_settings(search_pull_requests=False), warning=warning, exception=RuntimeError)
+        self.do_test_get_settings(SEARCH_PULL_REQUESTS=None, expected=self.get_settings(search_pull_requests=False))
+
     def test_get_settings_missing_github_vars(self):
         with self.assertRaises(RuntimeError) as re:
             self.do_test_get_settings(GITHUB_EVENT_PATH=None)
@@ -467,6 +623,14 @@ class Test(unittest.TestCase):
             self.do_test_get_settings(GITHUB_REPOSITORY=None)
         self.assertEqual('GitHub repository must be provided via action input or environment variable GITHUB_REPOSITORY', str(re.exception))
 
+    def test_get_settings_fork(self):
+        event = {"pull_request": {"head": {"repo": {"full_name": "fork/repo"}}}}
+        self.do_test_get_settings(event=event,
+                                  EVENT_NAME='pull_request',
+                                  GITHUB_REPOSITORY='repo',
+                                  expected=self.get_settings(is_fork=True, event=event, event_name='pull_request'),
+                                  warning=[])
+
     def do_test_get_settings_no_default_files(self,
                                               event: dict = {},
                                               gha: Optional[GithubAction] = None,
@@ -474,6 +638,8 @@ class Test(unittest.TestCase):
                                               expected: Settings = get_settings.__func__(),
                                               **kwargs):
         options = dict(**kwargs)
+        if 'FILES' not in kwargs:
+            options[f'FILES'] = None
         for flavour in ['JUNIT', 'NUNIT', 'XUNIT', 'TRX']:
             if f'{flavour}_FILES' not in kwargs:
                 options[f'{flavour}_FILES'] = None
@@ -500,8 +666,10 @@ class Test(unittest.TestCase):
                 TEST_CHANGES_LIMIT='10',  # not an int
                 CHECK_NAME='check name',  # defaults to 'Test Results'
                 GITHUB_TOKEN='token',
+                GITHUB_TOKEN_ACTOR='actor',
                 GITHUB_REPOSITORY='repo',
                 COMMIT='commit',  # defaults to get_commit_sha(event, event_name)
+                FILES='all-files',
                 JUNIT_FILES='junit-files',
                 NUNIT_FILES='nunit-files',
                 XUNIT_FILES='xunit-files',
@@ -513,7 +681,8 @@ class Test(unittest.TestCase):
                 DEDUPLICATE_CLASSES_BY_FILE_NAME='true',  # false unless 'true'
                 # annotations config tested in test_get_annotations_config*
                 SECONDS_BETWEEN_GITHUB_READS='1.5',
-                SECONDS_BETWEEN_GITHUB_WRITES='2.5'
+                SECONDS_BETWEEN_GITHUB_WRITES='2.5',
+                SECONDARY_RATE_LIMIT_WAIT_SECONDS='6.0',
             )
 
             # provide event via GITHUB_EVENT_PATH when there is no EVENT_FILE given
@@ -532,7 +701,7 @@ class Test(unittest.TestCase):
             # Note: functionality of get_annotations_config is simplified here,
             #       its true behaviour is tested in get_annotations_config*
             annotations_config = options.get('CHECK_RUN_ANNOTATIONS').split(',') \
-                if options.get('CHECK_RUN_ANNOTATIONS') is not None else []
+                if options.get('CHECK_RUN_ANNOTATIONS') is not None else default_annotations
             with mock.patch('publish_test_results.get_annotations_config', return_value=annotations_config) as m:
                 if gha is None:
                     gha = mock.MagicMock()
@@ -637,7 +806,7 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files('file1.txt')
+                files, _ = get_files('file1.txt')
                 self.assertEqual(['file1.txt'], sorted(files))
 
     def test_get_files_multi(self):
@@ -650,7 +819,7 @@ class Test(unittest.TestCase):
                             with open(filename, mode='w'):
                                 pass
 
-                        files = get_files(f'file1.txt{sep}file2.txt')
+                        files, _ = get_files(f'file1.txt{sep}file2.txt')
                         self.assertEqual(['file1.txt', 'file2.txt'], sorted(files))
 
     def test_get_files_single_wildcard(self):
@@ -663,7 +832,7 @@ class Test(unittest.TestCase):
                             with open(filename, mode='w'):
                                 pass
 
-                        files = get_files(wildcard)
+                        files, _ = get_files(wildcard)
                         self.assertEqual(['file1.txt', 'file2.txt'], sorted(files))
 
     def test_get_files_multi_wildcard(self):
@@ -676,8 +845,9 @@ class Test(unittest.TestCase):
                             with open(filename, mode='w'):
                                 pass
 
-                        files = get_files(f'*1.txt{sep}*3.bin')
+                        files, absolute = get_files(f'*1.txt{sep}*3.bin')
                         self.assertEqual(['file1.txt', 'file3.bin'], sorted(files))
+                        self.assertFalse(absolute)
 
     def test_get_files_subdir_and_wildcard(self):
         filenames = [os.path.join('sub', 'file1.txt'),
@@ -693,7 +863,7 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files('sub/*.txt')
+                files, _ = get_files('sub/*.txt')
                 self.assertEqual([os.path.join('sub', 'file1.txt'),
                                   os.path.join('sub', 'file2.txt')], sorted(files))
 
@@ -718,7 +888,7 @@ class Test(unittest.TestCase):
                             with open(filename, mode='w'):
                                 pass
 
-                        files = get_files(pattern)
+                        files, _ = get_files(pattern)
                         self.assertEqual(sorted(expected), sorted(files))
 
     def test_get_files_symlinks(self):
@@ -737,7 +907,7 @@ class Test(unittest.TestCase):
                                 pass
                         os.symlink(os.path.join(path, 'sub2'), os.path.join(path, 'sub1', 'sub2'), target_is_directory=True)
 
-                        files = get_files(pattern)
+                        files, _ = get_files(pattern)
                         self.assertEqual(sorted(expected), sorted(files))
 
     def test_get_files_character_range(self):
@@ -748,7 +918,7 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files('file[0-2].*')
+                files, _ = get_files('file[0-2].*')
                 self.assertEqual(['file1.txt', 'file2.txt'], sorted(files))
 
     def test_get_files_multi_match(self):
@@ -759,7 +929,7 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files('*.txt\nfile*.txt\nfile2.*')
+                files, _ = get_files('*.txt\nfile*.txt\nfile2.*')
                 self.assertEqual(['file1.txt', 'file2.txt'], sorted(files))
 
     def test_get_files_absolute_path_and_wildcard(self):
@@ -770,8 +940,9 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files(os.path.join(path, '*'))
+                files, absolute = get_files(os.path.join(path, '*'))
                 self.assertEqual([os.path.join(path, file) for file in filenames], sorted(files))
+                self.assertTrue(absolute)
 
     def test_get_files_exclude_only(self):
         filenames = ['file1.txt', 'file2.txt', 'file3.bin']
@@ -781,7 +952,7 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files('!file*.txt')
+                files, _ = get_files('!file*.txt')
                 self.assertEqual([], sorted(files))
 
     def test_get_files_include_and_exclude(self):
@@ -792,59 +963,86 @@ class Test(unittest.TestCase):
                     with open(filename, mode='w'):
                         pass
 
-                files = get_files('*.txt\n!file1.txt')
+                files, _ = get_files('*.txt\n!file1.txt')
                 self.assertEqual(['file2.txt'], sorted(files))
 
     def test_get_files_with_mock(self):
         with mock.patch('publish_test_results.glob') as m:
-            files = get_files('*.txt\n!file1.txt')
+            files, _ = get_files('*.txt\n!file1.txt')
             self.assertEqual([], files)
             self.assertEqual([mock.call('*.txt', recursive=True), mock.call('file1.txt', recursive=True)], m.call_args_list)
 
+    def test_prettify_glob_pattern(self):
+        self.assertEqual(None, prettify_glob_pattern(None))
+        self.assertEqual('', prettify_glob_pattern(''))
+        self.assertEqual('*.xml', prettify_glob_pattern('*.xml'))
+        self.assertEqual('*.xml, *.trx', prettify_glob_pattern('*.xml\n*.trx'))
+        self.assertEqual('*.xml,     *.trx', prettify_glob_pattern('  *.xml\n    *.trx\n    '))
+
     def test_parse_files(self):
         gha = mock.MagicMock()
-        settings = self.get_settings(junit_files_glob=str(test_files_path / 'junit-xml' / '**' / '*.xml'),
+        settings = self.get_settings(files_glob='\n'.join([str(test_files_path / '**' / '*.xml'),
+                                                           str(test_files_path / '**' / '*.trx'),
+                                                           str(test_files_path / '**' / '*.json'),
+                                                           "!" + str(test_files_path / '**' / '*.results.json')]),
+                                     junit_files_glob=str(test_files_path / 'junit-xml' / '**' / '*.xml'),
                                      nunit_files_glob=str(test_files_path / 'nunit' / '**' / '*.xml'),
                                      xunit_files_glob=str(test_files_path / 'xunit' / '**' / '*.xml'),
                                      trx_files_glob=str(test_files_path / 'trx' / '**' / '*.trx'))
         with mock.patch('publish_test_results.logger') as l:
             actual = parse_files(settings, gha)
 
-            self.assertEqual(5, len(l.info.call_args_list))
-            self.assertTrue(any([call.args[0].startswith(f'Reading JUnit files {settings.junit_files_glob} (26 files, ') for call in l.info.call_args_list]))
-            self.assertTrue(any([call.args[0].startswith(f'Reading NUnit files {settings.nunit_files_glob} (24 files, ') for call in l.info.call_args_list]))
-            self.assertTrue(any([call.args[0].startswith(f'Reading XUnit files {settings.xunit_files_glob} (8 files, ') for call in l.info.call_args_list]))
-            self.assertTrue(any([call.args[0].startswith(f'Reading TRX files {settings.trx_files_glob} (9 files, ') for call in l.info.call_args_list]))
-            self.assertTrue(any([call.args[0].startswith(f'Finished reading 67 files in ') for call in l.info.call_args_list]))
+            for call in l.info.call_args_list:
+                print(call.args[0])
 
-            self.assertEqual(4, len(l.debug.call_args_list))
-            self.assertTrue(any([call.args[0].startswith('reading JUnit files [') for call in l.debug.call_args_list]))
-            self.assertTrue(any([call.args[0].startswith('reading NUnit files [') for call in l.debug.call_args_list]))
-            self.assertTrue(any([call.args[0].startswith('reading XUnit files [') for call in l.debug.call_args_list]))
+            self.assertEqual(17, len(l.info.call_args_list))
+            self.assertTrue(any([call.args[0].startswith(f"Reading files {prettify_glob_pattern(settings.files_glob)} (76 files, ") for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Reading JUnit XML files {prettify_glob_pattern(settings.junit_files_glob)} (28 files, ') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Reading NUnit XML files {prettify_glob_pattern(settings.nunit_files_glob)} (24 files, ') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Reading XUnit XML files {prettify_glob_pattern(settings.xunit_files_glob)} (8 files, ') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Reading TRX files {prettify_glob_pattern(settings.trx_files_glob)} (9 files, ') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 27 JUnit XML files (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 24 NUnit XML files (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 8 XUnit XML files (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 9 TRX files (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 1 Dart JSON file (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 1 Mocha JSON file (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Detected 4 unsupported files (') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Unsupported file: ') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].endswith(f'python{os.sep}test{os.sep}files{os.sep}xml{os.sep}non-xml.xml') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].endswith(f'python{os.sep}test{os.sep}files{os.sep}junit-xml{os.sep}non-junit.xml') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].endswith(f'python{os.sep}test{os.sep}files{os.sep}json{os.sep}non-json.json') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].endswith(f'python{os.sep}test{os.sep}files{os.sep}json{os.sep}malformed-json.json') for call in l.info.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith(f'Finished reading 145 files in ') for call in l.info.call_args_list]))
+
+            for call in l.debug.call_args_list:
+                print(call.args[0])
+
+            self.assertEqual(11, len(l.debug.call_args_list))
+            self.assertTrue(any([call.args[0].startswith('reading files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('reading JUnit XML files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('reading NUnit XML files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('reading XUnit XML files [') for call in l.debug.call_args_list]))
             self.assertTrue(any([call.args[0].startswith('reading TRX files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('detected JUnit XML files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('detected NUnit XML files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('detected XUnit XML files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('detected TRX files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('detected Dart JSON files [') for call in l.debug.call_args_list]))
+            self.assertTrue(any([call.args[0].startswith('detected Mocha JSON files [') for call in l.debug.call_args_list]))
 
         self.assertEqual([], gha.method_calls)
 
-        self.assertEqual(67, actual.files)
-        if Version(sys.version.split(' ')[0]) >= Version('3.10.0') and sys.platform.startswith('darwin'):
-            # on macOS and Python 3.10 we see one particular error
-            self.assertEqual(8, len(actual.errors))
-            self.assertEqual(356, actual.suites)
-            self.assertEqual(1925, actual.suite_tests)
-            self.assertEqual(106, actual.suite_skipped)
-            self.assertEqual(224, actual.suite_failures)
-            self.assertEqual(8, actual.suite_errors)
-            self.assertEqual(3966, actual.suite_time)
-            self.assertEqual(1913, len(actual.cases))
-        else:
-            self.assertEqual(6, len(actual.errors))
-            self.assertEqual(358, actual.suites)
-            self.assertEqual(1929, actual.suite_tests)
-            self.assertEqual(106, actual.suite_skipped)
-            self.assertEqual(226, actual.suite_failures)
-            self.assertEqual(8, actual.suite_errors)
-            self.assertEqual(3966, actual.suite_time)
-            self.assertEqual(1917, len(actual.cases))
+        self.assertEqual(145, actual.files)
+        self.assertEqual(17, len(actual.errors))
+        self.assertEqual(731, actual.suites)
+        self.assertEqual(4109, actual.suite_tests)
+        self.assertEqual(214, actual.suite_skipped)
+        self.assertEqual(450, actual.suite_failures)
+        self.assertEqual(21, actual.suite_errors)
+        self.assertEqual(7956, actual.suite_time)
+        self.assertEqual(0, len(actual.suite_details))
+        self.assertEqual(4085, len(actual.cases))
         self.assertEqual('commit', actual.commit)
 
         with io.StringIO() as string:
@@ -852,32 +1050,58 @@ class Test(unittest.TestCase):
             with mock.patch('publish.github_action.logger') as m:
                 log_parse_errors(actual.errors, gha)
             expected = [
-                "::error::lxml.etree.XMLSyntaxError: Start tag expected, '<' not found, line 1, column 1",
-                "::error file=non-xml.xml::Error processing result file: Start tag expected, '<' not found, line 1, column 1 (non-xml.xml, line 1)",
-                "::error::Exception: File is empty.",
-                "::error file=empty.xml::Error processing result file: File is empty.",
+                # these occur twice, once from FILES and once from *_FILES options
                 "::error::lxml.etree.XMLSyntaxError: Premature end of data in tag skipped line 9, line 11, column 22",
                 "::error file=corrupt-xml.xml::Error processing result file: Premature end of data in tag skipped line 9, line 11, column 22 (corrupt-xml.xml, line 11)",
-                "::error::junitparser.junitparser.JUnitXmlError: Invalid format.",
-                "::error file=non-junit.xml::Error processing result file: Invalid format.",
                 "::error::lxml.etree.XMLSyntaxError: Char 0x0 out of allowed range, line 33, column 16",
                 "::error file=NUnit-issue17521.xml::Error processing result file: Char 0x0 out of allowed range, line 33, column 16 (NUnit-issue17521.xml, line 33)",
                 "::error::lxml.etree.XMLSyntaxError: attributes construct error, line 5, column 109",
-                "::error file=NUnit-issue47367.xml::Error processing result file: attributes construct error, line 5, column 109 (NUnit-issue47367.xml, line 5)"
+                "::error file=NUnit-issue47367.xml::Error processing result file: attributes construct error, line 5, column 109 (NUnit-issue47367.xml, line 5)",
+                "::error file=NUnit-sec1752-file.xml::Error processing result file: Entity 'xxe' not defined, line 17, column 51 (NUnit-sec1752-file.xml, line 17)",
+                "::error::lxml.etree.XMLSyntaxError: Entity 'xxe' not defined, line 17, column 51",
+                "::error file=NUnit-sec1752-https.xml::Error processing result file: Entity 'xxe' not defined, line 17, column 51 (NUnit-sec1752-https.xml, line 17)",
+                "::error::lxml.etree.XMLSyntaxError: Entity 'xxe' not defined, line 17, column 51",
+            ] * 2 + [
+                # these occur once, either from FILES and or from *_FILES options
+                "::error::Exception: File is empty.",
+                '::error::Exception: File is empty.',  # once from xml, once from json
+                '::error::RuntimeError: Unsupported file format: malformed-json.json',
+                '::error::RuntimeError: Unsupported file format: non-json.json',
+                "::error file=empty.xml::Error processing result file: File is empty.",
+                "::error file=non-junit.xml::Error processing result file: Unsupported file format: non-junit.xml",
+                "::error file=non-junit.xml::Error processing result file: Invalid format.",
+                "::error file=non-xml.xml::Error processing result file: Unsupported file format: non-xml.xml",
+                "::error::junitparser.junitparser.JUnitXmlError: Invalid format.",
+                "::error::RuntimeError: Unsupported file format: non-junit.xml",
+                '::error::RuntimeError: Unsupported file format: non-xml.xml',
+                '::error file=empty.json::Error processing result file: File is empty.',
+                '::error file=malformed-json.json::Error processing result file: Unsupported file format: malformed-json.json',
+                '::error file=non-json.json::Error processing result file: Unsupported file format: non-json.json',
             ]
-            if Version(sys.version.split(' ')[0]) >= Version('3.10.0') and sys.platform.startswith('darwin'):
-                expected.extend([
-                    '::error::lxml.etree.XMLSyntaxError: Failure to process entity xxe, line 17, column 51',
-                    '::error file=NUnit-sec1752-file.xml::Error processing result file: Failure to process entity xxe, line 17, column 51 (NUnit-sec1752-file.xml, line 17)',
-                    '::error::lxml.etree.XMLSyntaxError: Failure to process entity xxe, line 17, column 51',
-                    '::error file=NUnit-sec1752-https.xml::Error processing result file: Failure to process entity xxe, line 17, column 51 (NUnit-sec1752-https.xml, line 17)'
-                ])
             self.assertEqual(
                 sorted(expected),
-                sorted([re.sub(r'file=.*[/\\]', 'file=', re.sub(r'[(]file:.*/', '(', line))
+                sorted([re.sub(r'file=.*[/\\]', 'file=', re.sub(r'[(]file:.*/', '(', re.sub(r'format: .*[/\\]', 'format: ', line)))
                         for line in string.getvalue().split(os.linesep) if line])
             )
             # self.assertEqual([], m.method_calls)
+
+    def test_parse_files_with_suite_details(self):
+        for options in [
+            {'report_suite_out_logs': True, 'report_suite_err_logs': False},
+            {'report_suite_out_logs': False, 'report_suite_err_logs': True},
+            {'report_suite_out_logs': True, 'report_suite_err_logs': True},
+            {'json_suite_details': True}
+        ]:
+            with self.subTest(**options):
+                gha = mock.MagicMock()
+                settings = self.get_settings(junit_files_glob=str(test_files_path / 'junit-xml' / '**' / '*.xml'),
+                                             nunit_files_glob=str(test_files_path / 'nunit' / '**' / '*.xml'),
+                                             xunit_files_glob=str(test_files_path / 'xunit' / '**' / '*.xml'),
+                                             trx_files_glob=str(test_files_path / 'trx' / '**' / '*.trx'),
+                                             **options)
+                actual = parse_files(settings, gha)
+
+                self.assertEqual(363, len(actual.suite_details))
 
     def test_parse_files_no_matches(self):
         gha = mock.MagicMock()
@@ -893,10 +1117,18 @@ class Test(unittest.TestCase):
         actual = parse_files(settings, gha)
 
         gha.warning.assert_has_calls([
-            mock.call(f'Could not find any JUnit files for {missing_junit}'),
-            mock.call(f'Could not find any NUnit files for {missing_nunit}'),
-            mock.call(f'Could not find any XUnit files for {missing_xunit}'),
-            mock.call(f'Could not find any TRX files for {missing_trx}')
+            mock.call(f'Could not find any JUnit XML files for {missing_junit}'),
+            mock.call(f'Your file pattern contains absolute paths, please read the notes on absolute paths:'),
+            mock.call(f'https://github.com/EnricoMi/publish-unit-test-result-action/blob/{__version__}/README.md#running-with-absolute-paths'),
+            mock.call(f'Could not find any NUnit XML files for {missing_nunit}'),
+            mock.call(f'Your file pattern contains absolute paths, please read the notes on absolute paths:'),
+            mock.call(f'https://github.com/EnricoMi/publish-unit-test-result-action/blob/{__version__}/README.md#running-with-absolute-paths'),
+            mock.call(f'Could not find any XUnit XML files for {missing_xunit}'),
+            mock.call(f'Your file pattern contains absolute paths, please read the notes on absolute paths:'),
+            mock.call(f'https://github.com/EnricoMi/publish-unit-test-result-action/blob/{__version__}/README.md#running-with-absolute-paths'),
+            mock.call(f'Could not find any TRX files for {missing_trx}'),
+            mock.call(f'Your file pattern contains absolute paths, please read the notes on absolute paths:'),
+            mock.call(f'https://github.com/EnricoMi/publish-unit-test-result-action/blob/{__version__}/README.md#running-with-absolute-paths'),
         ])
         gha.error.assert_not_called()
 
@@ -911,51 +1143,6 @@ class Test(unittest.TestCase):
         self.assertEqual(0, len(actual.cases))
         self.assertEqual('commit', actual.commit)
 
-    def test_throttle_gh_request_raw(self):
-        logging.root.level = logging.getLevelName('INFO')
-        logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)5s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S %z')
-
-        method = mock.Mock(return_value='response')
-        throttled_method = throttle_gh_request_raw(2, 5, method)
-
-        def test_request(verb: str, expected_sleep: Optional[float]):
-            with mock.patch('publish_test_results.time.sleep') as sleep:
-                response = throttled_method('cnx', verb, 'url', 'headers', 'input')
-
-                self.assertEqual('response', response)
-                method.assert_called_once_with('cnx', verb, 'url', 'headers', 'input')
-                method.reset_mock()
-
-                if expected_sleep is not None:
-                    sleep.assert_called_once()
-                    slept = sleep.call_args[0][0]
-                    self.assertLessEqual(slept, expected_sleep)
-                    self.assertGreater(slept, expected_sleep - 0.5)
-                else:
-                    sleep.assert_not_called()
-
-        test_request('GET', None)
-        test_request('GET', 2.0)
-        test_request('GET', 2.0)
-        test_request('POST', 2.0)
-        test_request('POST', 5.0)
-        test_request('POST', 5.0)
-        test_request('GET', 2.0)
-        # these five seconds are since last write, and they include the 2 seconds of last read,
-        # but those 2 seconds have not been waited so it still sleeps 5 seconds
-        test_request('POST', 5.0)
-
-    def test_throttle_gh_request_raw_exception(self):
-        def exc(*args, **kwargs):
-            raise RuntimeError('request fails')
-
-        method = mock.Mock(side_effect=exc)
-        throttled_method = throttle_gh_request_raw(2, 5, method)
-
-        with self.assertRaises(RuntimeError) as re:
-            throttled_method('cnx', 'GET', 'url', 'headers', 'input')
-        self.assertIn('request fails', re.exception.args)
-
     def test_is_float(self):
         for value, expected in [
             ('0', True), ('0.0', True), ('.0', True), ('0.', True),
@@ -966,7 +1153,48 @@ class Test(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(expected, is_float(value), value)
 
-    def test_main_fork_pr_check(self):
+    def test_main(self):
+        with tempfile.TemporaryDirectory() as path:
+            filepath = os.path.join(path, 'file')
+            with open(filepath, 'wt', encoding='utf-8') as file:
+                file.write('{}')
+
+            gha = mock.MagicMock()
+            settings = get_settings(dict(
+                COMMIT='commit',
+                GITHUB_TOKEN='********',
+                GITHUB_EVENT_PATH=file.name,
+                GITHUB_EVENT_NAME='push',
+                GITHUB_REPOSITORY='repo',
+                EVENT_FILE=None,
+                FILES='\n'.join(path for path in [str(test_files_path / '**' / '*.xml'),
+                                                  str(test_files_path / '**' / '*.trx'),
+                                                  str(test_files_path / '**' / '*.json'),
+                                                  "!" + str(test_files_path / '**' / '*.results.json')]),
+                JUNIT_FILES=str(test_files_path / 'junit-xml' / '**' / '*.xml'),
+                NUNIT_FILES=str(test_files_path / 'nunit' / '**' / '*.xml'),
+                XUNIT_FILES=str(test_files_path / 'xunit' / '**' / '*.xml'),
+                TRX_FILES=str(test_files_path / 'trx' / '**' / '*.trx'),
+                REPORT_SUITE_LOGS='info'
+            ), gha)
+
+            with mock.patch('publish_test_results.get_github'), \
+                 mock.patch('publish.publisher.Publisher.publish') as m:
+                main(settings, gha)
+
+                # Publisher.publish is expected to have been called once
+                self.assertEqual(1, len(m.call_args_list))
+                self.assertEqual(3, len(m.call_args_list[0].args))
+
+                # Publisher.publish is expected to have been called with these arguments
+                results, cases, conclusion = m.call_args_list[0].args
+                self.assertEqual(145, results.files)
+                self.assertEqual(731, results.suites)
+                self.assertEqual(731, len(results.suite_details))
+                self.assertEqual(1811, len(cases))
+                self.assertEqual('failure', conclusion)
+
+    def test_main_fork_pr_check_wo_summary(self):
         with tempfile.TemporaryDirectory() as path:
             filepath = os.path.join(path, 'file')
             with open(filepath, 'wt', encoding='utf-8') as file:
@@ -979,7 +1207,8 @@ class Test(unittest.TestCase):
                 GITHUB_EVENT_PATH=file.name,
                 GITHUB_EVENT_NAME='pull_request',
                 GITHUB_REPOSITORY='repo',
-                EVENT_FILE=None
+                EVENT_FILE=None,
+                JOB_SUMMARY='false'
             ), gha)
 
             def do_raise(*args):
@@ -992,11 +1221,12 @@ class Test(unittest.TestCase):
 
             gha.warning.assert_has_calls([
                 mock.call('This action is running on a pull_request event for a fork repository. '
-                          'It cannot do anything useful like creating check runs or pull request '
-                          'comments. To run the action on fork repository pull requests, see '
-                          'https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20'
+                          'The only useful thing it can do in this situation is creating a job summary, '
+                          'which is disabled in settings. To fully run the action on fork repository pull requests, '
+                          f'see https://github.com/EnricoMi/publish-unit-test-result-action/blob/{__version__}'
                           '/README.md#support-fork-repositories-and-dependabot-branches'),
-                mock.call('At least one of the *_FILES options has to be set! '
+                mock.call('At least one of the FILES, JUNIT_FILES, NUNIT_FILES, XUNIT_FILES, '
+                          'or TRX_FILES options has to be set! '
                           'Falling back to deprecated default "*.xml"')
             ], any_order=True)
 
@@ -1053,3 +1283,15 @@ class Test(unittest.TestCase):
 
             deprecate_val('deprecated', 'deprecated_var', {'deprecated': 'replace'}, None)
             l.warning.assert_called_once_with('Value "deprecated" for option deprecated_var is deprecated! Instead, use value "replace".')
+
+    def test_action_fail(self):
+        for action_fail, action_fail_on_inconclusive, expecteds in [
+            (False, False, [False] * 4),
+            (False, True, [True, False, False, False]),
+            (True, False, [False, False, True, False]),
+            (True, True, [True, False, True, False]),
+        ]:
+            for expected, conclusion in zip(expecteds, ['neutral', 'success', 'failure', 'unknown']):
+                with self.subTest(action_fail=action_fail, action_fail_on_inconclusive=action_fail_on_inconclusive, conclusion=conclusion):
+                    actual = action_fail_required(conclusion, action_fail, action_fail_on_inconclusive)
+                    self.assertEqual(expected, actual)

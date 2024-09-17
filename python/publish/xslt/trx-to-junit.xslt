@@ -3,6 +3,7 @@
 <!-- and https://github.com/medlab/xunitparserx/blob/2cc8b68b0c5ce9c60da2934cb2cce10c8330536e/trx-to-junit.xslt -->
 <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:a="http://microsoft.com/schemas/VisualStudio/TeamTest/2006" xmlns:b="http://microsoft.com/schemas/VisualStudio/TeamTest/2010" >
   <xsl:output method="xml" indent="yes" />
+  <xsl:key name="unitTests" match="//b:TestDefinitions/b:UnitTest" use="@id"/>
   <xsl:template match="/">
     <testsuites>
       <xsl:variable name="numberOfTests" select="count(//a:UnitTestResult/@testId) + count(//b:UnitTestResult/@testId)"/>
@@ -21,9 +22,9 @@
           <xsl:variable name="totalduration">
             <xsl:choose>
               <xsl:when test="@duration">
-                <xsl:variable name="duration_seconds" select="substring(@duration, 7)"/>
-                <xsl:variable name="duration_minutes" select="substring(@duration, 4,2 )"/>
-                <xsl:variable name="duration_hours" select="substring(@duration, 1, 2)"/>
+                <xsl:variable name="duration_seconds" select="number(substring(@duration, 7))"/>
+                <xsl:variable name="duration_minutes" select="number(substring(@duration, 4,2 ))"/>
+                <xsl:variable name="duration_hours" select="number(substring(@duration, 1, 2))"/>
                 <xsl:value-of select="format-number($duration_hours*3600 + $duration_minutes*60 + $duration_seconds, '#.#######')"/>
               </xsl:when>
               <xsl:when test="@startTime and @endTime">
@@ -114,9 +115,9 @@
           <xsl:variable name="totalduration">
             <xsl:choose>
               <xsl:when test="@duration">
-                <xsl:variable name="duration_seconds" select="substring(@duration, 7)"/>
-                <xsl:variable name="duration_minutes" select="substring(@duration, 4,2 )"/>
-                <xsl:variable name="duration_hours" select="substring(@duration, 1, 2)"/>
+                <xsl:variable name="duration_seconds" select="number(substring(@duration, 7))"/>
+                <xsl:variable name="duration_minutes" select="number(substring(@duration, 4,2 ))"/>
+                <xsl:variable name="duration_hours" select="number(substring(@duration, 1, 2))"/>
                 <xsl:value-of select="format-number($duration_hours*3600 + $duration_minutes*60 + $duration_seconds, '#.#######')"/>
               </xsl:when>
               <xsl:when test="@startTime and @endTime">
@@ -149,7 +150,7 @@
           </xsl:variable>
           <xsl:variable name="message" select="b:Output/b:ErrorInfo/b:Message"/>
           <xsl:variable name="stacktrace" select="b:Output/b:ErrorInfo/b:StackTrace"/>
-          <xsl:for-each select="//b:UnitTest[@id = $testId]">
+          <xsl:for-each select="key('unitTests', $testId)">
             <xsl:variable name="className">
               <xsl:choose>
                 <xsl:when test="contains(b:TestMethod/@className, ',')">
@@ -222,12 +223,12 @@
     <xsl:variable name="local-time" select="substring($time, 1, string-length($time) - 6)" />
     <xsl:variable name="offset" select="substring-after($time, $local-time)" />
 
-    <xsl:variable name="year" select="substring($date, 1, 4)" />
-    <xsl:variable name="month" select="substring($date, 6, 2)" />
-    <xsl:variable name="day" select="substring($date, 9, 2)" />
+    <xsl:variable name="year" select="number(substring($date, 1, 4))" />
+    <xsl:variable name="month" select="number(substring($date, 6, 2))" />
+    <xsl:variable name="day" select="number(substring($date, 9, 2))" />
 
-    <xsl:variable name="hour" select="substring($local-time, 1, 2)" />
-    <xsl:variable name="minute" select="substring($local-time, 4, 2)" />
+    <xsl:variable name="hour" select="number(substring($local-time, 1, 2))" />
+    <xsl:variable name="minute" select="number(substring($local-time, 4, 2))" />
     <xsl:variable name="second-and-fraction" select="substring($local-time, 7)" />
     <xsl:variable name="second">
       <xsl:choose>

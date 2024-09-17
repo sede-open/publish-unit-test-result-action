@@ -5,17 +5,21 @@ from xml.etree.ElementTree import ParseError as XmlParseError
 
 from publish.unittestresults import get_test_results, get_stats, get_stats_delta, \
     ParsedUnitTestResults, ParsedUnitTestResultsWithCommit, \
-    UnitTestCase, UnitTestResults, create_unit_test_case_results, \
+    UnitTestCase, UnitTestResults, UnitTestSuite, create_unit_test_case_results, \
     UnitTestRunResults, UnitTestRunDeltaResults, ParseError
 from test_utils import d, n
 
 errors = [ParseError('file', 'error', exception=ValueError("Invalid value"))]
-errors_dict = [dataclasses.asdict(e.without_exception()) for e in errors]
+errors_dict = [{k: v
+                for k, v in dataclasses.asdict(e.without_exception()).items()
+                if v is not None}
+               for e in errors]
 
 
 def create_unit_test_run_results(files=1,
                                  errors: List[ParseError] = [],
                                  suites=2,
+                                 suite_details=None,
                                  duration=3,
                                  tests=22, tests_succ=4, tests_skip=5, tests_fail=6, tests_error=7,
                                  runs=38, runs_succ=8, runs_skip=9, runs_fail=10, runs_error=11,
@@ -24,6 +28,7 @@ def create_unit_test_run_results(files=1,
         files=files,
         errors=list(errors),
         suites=suites,
+        suite_details=suite_details,
         duration=duration,
         tests=tests, tests_succ=tests_succ, tests_skip=tests_skip, tests_fail=tests_fail, tests_error=tests_error,
         runs=runs, runs_succ=runs_succ, runs_skip=runs_skip, runs_fail=runs_fail, runs_error=runs_error,
@@ -50,6 +55,7 @@ def create_unit_test_run_delta_results(files=1, files_delta=-1,
         errors=errors,
         suites={'number': suites, 'delta': suites_delta},
         duration={'duration': duration, 'delta': duration_delta},
+        suite_details=TestUnitTestResults.details,
         tests={'number': tests, 'delta': tests_delta}, tests_succ={'number': tests_succ, 'delta': tests_succ_delta}, tests_skip={'number': tests_skip, 'delta': tests_skip_delta}, tests_fail={'number': tests_fail, 'delta': tests_fail_delta}, tests_error={'number': tests_error, 'delta': tests_error_delta},
         runs={'number': runs, 'delta': runs_delta}, runs_succ={'number': runs_succ, 'delta': runs_succ_delta}, runs_skip={'number': runs_skip, 'delta': runs_skip_delta}, runs_fail={'number': runs_fail, 'delta': runs_fail_delta}, runs_error={'number': runs_error, 'delta': runs_error_delta},
         commit='commit',
@@ -58,6 +64,7 @@ def create_unit_test_run_delta_results(files=1, files_delta=-1,
 
 
 class TestUnitTestResults(unittest.TestCase):
+    details = [UnitTestSuite('suite', 7, 3, 2, 1, 'std-out', 'std-err')]
 
     def test_parse_error_from_xml_parse_error(self):
         error = XmlParseError('xml parse error')
@@ -91,7 +98,7 @@ class TestUnitTestResults(unittest.TestCase):
             ParsedUnitTestResultsWithCommit(
                 files=1,
                 errors=errors,
-                suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+                suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
                 cases=[
                     UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                     UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test2', result='skipped', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2),
@@ -106,7 +113,7 @@ class TestUnitTestResults(unittest.TestCase):
             ParsedUnitTestResults(
                 files=1,
                 errors=errors,
-                suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+                suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
                 cases=[
                     UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                     UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test2', result='skipped', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2),
@@ -124,6 +131,12 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(create_unit_test_run_results(errors=[error.without_exception() for error in errors]),
                          results.without_exceptions())
 
+    def test_unit_test_run_results_without_suite_details(self):
+        suite = UnitTestSuite('suite', 7, 3, 2, 1, 'stdout', 'stderr')
+        results = create_unit_test_run_results(suite_details=[suite])
+        self.assertEqual(create_unit_test_run_results(suite_details=None),
+                         results.without_suite_details())
+
     def test_unit_test_run_delta_results_without_exception(self):
         results = create_unit_test_run_delta_results(errors=errors)
         self.assertEqual(create_unit_test_run_delta_results(errors=[error.without_exception() for error in errors]),
@@ -131,7 +144,7 @@ class TestUnitTestResults(unittest.TestCase):
 
     def test_unit_test_run_results_to_dict(self):
         actual = UnitTestRunResults(
-            files=1, errors=errors, suites=2, duration=3,
+            files=1, errors=errors, suites=2, duration=3, suite_details=self.details,
             tests=4, tests_succ=5, tests_skip=6, tests_fail=7, tests_error=8,
             runs=9, runs_succ=10, runs_skip=11, runs_fail=12, runs_error=13,
             commit='commit'
@@ -153,7 +166,7 @@ class TestUnitTestResults(unittest.TestCase):
             commit='commit'
         ))
         expected = UnitTestRunResults(
-            files=1, errors=errors_dict, suites=2, duration=3,
+            files=1, errors=errors_dict, suites=2, duration=3, suite_details=None,
             tests=4, tests_succ=5, tests_skip=6, tests_fail=7, tests_error=8,
             runs=9, runs_succ=10, runs_skip=11, runs_fail=12, runs_error=13,
             commit='commit'
@@ -162,13 +175,13 @@ class TestUnitTestResults(unittest.TestCase):
 
     def test_unit_test_run_results_from_dict_without_errors(self):
         actual = UnitTestRunResults.from_dict(dict(
-            files=1, suites=2, duration=3,
+            files=1, suites=2, duration=3, suite_details=self.details,
             tests=4, tests_succ=5, tests_skip=6, tests_fail=7, tests_error=8,
             runs=9, runs_succ=10, runs_skip=11, runs_fail=12, runs_error=13,
             commit='commit'
         ))
         expected = UnitTestRunResults(
-            files=1, errors=[], suites=2, duration=3,
+            files=1, errors=[], suites=2, duration=3, suite_details=None,
             tests=4, tests_succ=5, tests_skip=6, tests_fail=7, tests_error=8,
             runs=9, runs_succ=10, runs_skip=11, runs_fail=12, runs_error=13,
             commit='commit'
@@ -179,13 +192,13 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(ParsedUnitTestResultsWithCommit(
             files=0,
             errors=[],
-            suites=0, suite_tests=0, suite_skipped=0, suite_failures=0, suite_errors=0, suite_time=0,
+            suites=0, suite_tests=0, suite_skipped=0, suite_failures=0, suite_errors=0, suite_time=0, suite_details=self.details,
             cases=[],
             commit='commit'
         ), False), UnitTestResults(
             files=0,
             errors=[],
-            suites=0, suite_tests=0, suite_skipped=0, suite_failures=0, suite_errors=0, suite_time=0,
+            suites=0, suite_tests=0, suite_skipped=0, suite_failures=0, suite_errors=0, suite_time=0, suite_details=self.details,
             cases=0, cases_skipped=0, cases_failures=0, cases_errors=0, cases_time=0, case_results=create_unit_test_case_results(),
             tests=0, tests_skipped=0, tests_failures=0, tests_errors=0,
             commit='commit'
@@ -195,7 +208,7 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(ParsedUnitTestResultsWithCommit(
             files=1,
             errors=errors,
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=[
                 UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                 UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test2', result='skipped', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2),
@@ -209,7 +222,7 @@ class TestUnitTestResults(unittest.TestCase):
         ), False), UnitTestResults(
             files=1,
             errors=errors,
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=7, cases_skipped=2, cases_failures=3, cases_errors=1, cases_time=28,
             case_results=create_unit_test_case_results({
                 (None, 'class1', 'test1'): dict(success=[UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1)]),
@@ -228,7 +241,7 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(ParsedUnitTestResultsWithCommit(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=[
                 UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                 UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2),
@@ -251,7 +264,7 @@ class TestUnitTestResults(unittest.TestCase):
         ), False), UnitTestResults(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=10, cases_skipped=3, cases_failures=1, cases_errors=1, cases_time=55,
             case_results=create_unit_test_case_results({
                 (None, 'class1', 'test1'): dict(success=[UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1), UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2)]),
@@ -268,7 +281,7 @@ class TestUnitTestResults(unittest.TestCase):
         with_duplicates = ParsedUnitTestResultsWithCommit(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=[
                 UnitTestCase(result_file='result', test_file='test1', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                 UnitTestCase(result_file='result', test_file='test2', line=123, class_name='class1', test_name='test1', result='success', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2),
@@ -293,7 +306,7 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(with_duplicates, False), UnitTestResults(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=10, cases_skipped=3, cases_failures=1, cases_errors=1, cases_time=55,
             case_results=create_unit_test_case_results({
                 (None, 'class1', 'test1'): dict(success=[UnitTestCase(result_file='result', test_file='test1', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1), UnitTestCase(result_file='result', test_file='test2', line=123, class_name='class1', test_name='test1', result='success', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2)]),
@@ -309,7 +322,7 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(with_duplicates, True), UnitTestResults(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=10, cases_skipped=3, cases_failures=1, cases_errors=1, cases_time=55,
             case_results=create_unit_test_case_results({
                 ('test1', 'class1', 'test1'): dict(success=[UnitTestCase(result_file='result', test_file='test1', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1)]),
@@ -331,7 +344,7 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(ParsedUnitTestResultsWithCommit(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=[
                 UnitTestCase(result_file='result', test_file=None, line=None, class_name='class', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                 UnitTestCase(result_file='result', test_file=None, line=None, class_name='class', test_name='test1', result='skipped', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=None),
@@ -342,7 +355,7 @@ class TestUnitTestResults(unittest.TestCase):
         ), False), UnitTestResults(
             files=1,
             errors=[],
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=4, cases_skipped=2, cases_failures=1, cases_errors=0, cases_time=3,
             case_results=create_unit_test_case_results({
                 (None, 'class', 'test1'): dict(success=[UnitTestCase(result_file='result', test_file=None, line=None, class_name='class', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1)], skipped=[UnitTestCase(result_file='result', test_file=None, line=None, class_name='class', test_name='test1', result='skipped', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=None)]),
@@ -356,7 +369,7 @@ class TestUnitTestResults(unittest.TestCase):
         self.assertEqual(get_test_results(ParsedUnitTestResultsWithCommit(
             files=1,
             errors=errors,
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=[
                 UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1),
                 UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test2', result='skipped', message='message2', content='content2', stdout='stdout2', stderr='stderr2', time=2),
@@ -370,7 +383,7 @@ class TestUnitTestResults(unittest.TestCase):
         ), False), UnitTestResults(
             files=1,
             errors=errors,
-            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7,
+            suites=2, suite_tests=3, suite_skipped=4, suite_failures=5, suite_errors=6, suite_time=7, suite_details=self.details,
             cases=7, cases_skipped=2, cases_failures=3, cases_errors=1, cases_time=28,
             case_results=create_unit_test_case_results({
                 (None, 'class1', 'test1'): dict(success=[UnitTestCase(result_file='result', test_file='test', line=123, class_name='class1', test_name='test1', result='success', message='message1', content='content1', stdout='stdout1', stderr='stderr1', time=1)]),
@@ -396,6 +409,7 @@ class TestUnitTestResults(unittest.TestCase):
             suite_failures=6,
             suite_errors=7,
             suite_time=3,
+            suite_details=self.details,
 
             cases=40,
             cases_skipped=11,
@@ -415,6 +429,8 @@ class TestUnitTestResults(unittest.TestCase):
             errors=errors,
             suites=2,
             duration=3,
+
+            suite_details=self.details,
 
             tests=30,
             tests_succ=3,
@@ -437,6 +453,7 @@ class TestUnitTestResults(unittest.TestCase):
             errors=errors,
             suites=2,
             duration=3,
+            suite_details=self.details,
 
             tests=20,
             tests_succ=2,
@@ -457,6 +474,8 @@ class TestUnitTestResults(unittest.TestCase):
             suites=5,
             duration=7,
 
+            suite_details=self.details,
+
             tests=41,
             tests_succ=5,
             tests_skip=11,
@@ -475,6 +494,8 @@ class TestUnitTestResults(unittest.TestCase):
             errors=errors,
             suites=n(2, -3),
             duration=d(3, -4),
+
+            suite_details=self.details,
 
             tests=n(20, -21),
             tests_succ=n(2, -3),

@@ -15,24 +15,13 @@ jobs:
     permissions:
       checks: write
       pull-requests: write
-      # required by download step to access artifacts API
-      actions: read
 
     steps:
       - name: Download and Extract Artifacts
-        env:
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-        run: |
-          mkdir -p artifacts && cd artifacts
-
-          artifacts_url=${{ github.event.workflow_run.artifacts_url }}
-
-          gh api --paginate "$artifacts_url" -q '.artifacts[] | [.name, .archive_download_url] | @tsv' | while read artifact
-          do
-            IFS=$'\t' read name url <<< "$artifact"
-            gh api $url > "$name.zip"
-            unzip -d "$name" "$name.zip"
-          done
+        uses: dawidd6/action-download-artifact@e7466d1a7587ed14867642c2ca74b5bcc1e19a2d
+        with:
+          run_id: ${{ github.event.workflow_run.id }}
+          path: artifacts
 
       - name: Publish Test Results
         id: test-results
@@ -47,7 +36,7 @@ jobs:
           log_level: DEBUG
 
       - name: Set badge color
-        shell: bash
+        if: github.event.workflow_run.event != 'schedule'
         run: |
           case ${{ fromJSON( steps.test-results.outputs.json ).conclusion }} in
             success)
@@ -60,9 +49,11 @@ jobs:
               echo "BADGE_COLOR=696969" >> $GITHUB_ENV
               ;;
           esac
+        shell: bash
 
       - name: Create badge
-        uses: emibcn/badge-action@d6f51ff11b5c3382b3b88689ae2d6db22d9737d1
+        if: github.event.workflow_run.event != 'schedule'
+        uses: emibcn/badge-action@4209421db54c8764d8932070ffd0f81715a629bf
         with:
           label: Tests
           status: '${{ fromJSON( steps.test-results.outputs.json ).formatted.stats.tests }} tests, ${{ fromJSON( steps.test-results.outputs.json ).formatted.stats.runs }} runs: ${{ fromJSON( steps.test-results.outputs.json ).conclusion }}'
@@ -70,10 +61,9 @@ jobs:
           path: tests.svg
 
       - name: Upload badge to Gist
-        # Upload only for master branch
+        # Upload only for master branch and not for scheduled event
         if: >
-          github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master' ||
-          github.event_name != 'workflow_run' && github.ref == 'refs/heads/master'
+          github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master' && github.event.workflow_run.event != 'schedule'
         uses: andymckay/append-gist-action@1fbfbbce708a39bd45846f0955ed5521f2099c6d
         with:
           token: ${{ secrets.GIST_TOKEN }}
